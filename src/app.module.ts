@@ -6,9 +6,10 @@ import { SubscriptionsModule } from './subscriptions/subscriptions.module';
 import { EquipmentModule } from './equipment/equipment.module';
 import { TelematicsModule } from './telematics/telematics.module';
 import { FuelModule } from './fuel/fuel.module';
+import { ProductionModule } from './production/production.module';
 
 @Module({
-  imports: [AuthModule, SubscriptionsModule, EquipmentModule, TelematicsModule, FuelModule],
+  imports: [AuthModule, SubscriptionsModule, EquipmentModule, TelematicsModule, FuelModule, ProductionModule],
   controllers: [AppController],
   providers: [AppService],
 })
