@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException, Logger } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 
 @Injectable()
@@ -7,49 +7,94 @@ export class TelematicsService {
 
   constructor(private prisma: PrismaService) {}
 
-  async processIncomingData(payload: any) {
-    const { imei, latitude, longitude, speed, engineStatus, fuelLevelPercent, timestamp } = payload;
-
-    // 1. Find the equipment associated with this GPS Tracker IMEI
-    const equipment = await this.prisma.equipment.findUnique({
-      where: { deviceImei: imei },
+  // 1. The Webhook + Delta Engine
+  async processIncomingData(data: any) {
+    const equipment = await this.prisma.equipment.findFirst({
+      where: { deviceImei: data.imei },
     });
 
     if (!equipment) {
-      this.logger.warn(`Received telemetry for unknown IMEI: ${imei}`);
-      throw new NotFoundException('Unregistered device IMEI');
+      this.logger.warn(`Webhook rejected: Unknown IMEI ${data.imei}`);
+      return { success: false, message: 'Equipment not found' };
     }
 
-    // 2. Insert the high-frequency record
-    const telemetryRecord = await this.prisma.gpsTelematics.create({
+    // The Delta Engine for Automated Fuel Tracking
+    if (data.fuelLevelPercent !== undefined) {
+      // Using your corrected gpsTelematics and receivedAt properties
+      const lastPing = await this.prisma.gpsTelematics.findFirst({
+        where: { equipmentId: equipment.id },
+        orderBy: { receivedAt: 'desc' }, 
+      });
+
+      if (lastPing && lastPing.fuelLevelPercent !== null) {
+        const oldFuel = Number(lastPing.fuelLevelPercent);
+        const newFuel = Number(data.fuelLevelPercent);
+        const fuelDiff = newFuel - oldFuel;
+
+        const tankCapacity = Number(equipment.fuelCapacity) || 0;
+        const estimatedLiters = tankCapacity > 0 
+          ? (Math.abs(fuelDiff) / 100) * tankCapacity 
+          : 0;
+
+        if (fuelDiff >= 5.0) {
+          this.logger.log(`[DELTA ENGINE] Refill detected: +${fuelDiff}% (${estimatedLiters} Liters)`);
+          
+          await this.prisma.fuelLog.create({
+            data: {
+              companyId: equipment.companyId,
+              equipmentId: equipment.id,
+              logType: 'REFUEL',
+              quantityLiters: estimatedLiters,
+              costPerLiter: null, 
+            }
+          });
+        } 
+        else if (fuelDiff <= -3.0 && data.engineStatus === false) {
+          this.logger.warn(`[DELTA ENGINE] THEFT ALERT! Dropped: ${fuelDiff}% (${estimatedLiters} Liters)`);
+          
+          await this.prisma.fuelLog.create({
+            data: {
+              companyId: equipment.companyId,
+              equipmentId: equipment.id,
+              logType: 'THEFT_ALERT',
+              quantityLiters: estimatedLiters,
+              costPerLiter: null,
+            }
+          });
+        }
+      }
+    }
+
+    // Save the new GPS location and fuel state
+    await this.prisma.gpsTelematics.create({
       data: {
         equipmentId: equipment.id,
-        latitude: latitude,
-        longitude: longitude,
-        speed: speed ?? 0,
-        engineStatus: engineStatus ?? false,
-        fuelLevelPercent: fuelLevelPercent ?? null,
-        receivedAt: timestamp ? new Date(timestamp) : new Date(),
+        latitude: data.latitude,
+        longitude: data.longitude,
+        speed: data.speed ?? 0,
+        engineStatus: data.engineStatus ?? false,
+        fuelLevelPercent: data.fuelLevelPercent ?? null,
       },
     });
 
-    this.logger.log(`Telemetry saved for Equipment ID: ${equipment.id}`);
-    return { success: true, recordId: telemetryRecord.id.toString() };
+    return { success: true };
   }
 
-  // A helper function for the Frontend to pull the latest location of all fleet assets
+  // 2. The Map Data Fetcher (Restored for the Flutter App)
   async getLatestFleetLocations(companyId: string) {
-    // In a production app, we would use a Redis cache here. 
-    // For MVP, we query the latest record for each machine.
     return this.prisma.equipment.findMany({
       where: { companyId },
-      include: {
-        // We just want the most recent GPS ping
-        telematics: {
+      select: {
+        id: true,
+        name: true,
+        category: true,
+        status: true,
+        // Using your corrected gpsTelematics and receivedAt properties
+        telematics: { 
           orderBy: { receivedAt: 'desc' },
-          take: 1, 
-        }
-      }
+          take: 1,
+        },
+      },
     });
   }
 }
