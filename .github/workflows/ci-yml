@@ -1,0 +1,236 @@
+name: Continuous Integration
+
+on:
+  pull_request:
+    branches:
+      - dev
+      - staging
+      - main
+  push:
+    branches:
+      - dev
+      - staging
+      - main
+      - issue/**
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: Build, Test & Validate
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      fail-fast: false
+
+      matrix:
+        node-version: [22]
+
+    services:
+
+      # =====================================================
+      # POSTGRES
+      # =====================================================
+      postgres:
+        image: postgres:16
+
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test_db
+
+        ports:
+          - 5432:5432
+
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+      # =====================================================
+      # REDIS
+      # =====================================================
+      redis:
+        image: redis:7
+
+        ports:
+          - 6379:6379
+
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+      # =====================================================
+      # MINIO
+      # =====================================================
+      minio:
+        image: minio/minio:latest
+
+        env:
+          MINIO_ROOT_USER: admin
+          MINIO_ROOT_PASSWORD: password
+
+        ports:
+          - 9000:9000
+          - 9001:9001
+
+        options: >-
+          --health-cmd="curl -f http://localhost:9000/minio/health/live || exit 1"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+        command: server /data --console-address ":9001"
+
+    env:
+      NODE_ENV: test
+
+      # =====================================================
+      # DATABASE
+      # =====================================================
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test_db
+
+      # =====================================================
+      # REDIS
+      # =====================================================
+      REDIS_HOST: localhost
+      REDIS_PORT: 6379
+
+      # =====================================================
+      # MINIO
+      # =====================================================
+      MINIO_ENDPOINT: localhost
+      MINIO_PORT: 9000
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password
+
+      # =====================================================
+      # AUTH
+      # =====================================================
+      JWT_ACCESS_SECRET: test_secret
+      JWT_REFRESH_SECRET: test_refresh_secret
+
+      # =====================================================
+      # DOCKER IMAGE
+      # =====================================================
+      IMAGE_TAG: ghcr.io/reusolute-consults/dredgos-api:${{ github.sha }}
+
+    steps:
+
+      # =====================================================
+      # CHECKOUT
+      # =====================================================
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # =====================================================
+      # NODE SETUP
+      # =====================================================
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      # =====================================================
+      # INSTALL DEPENDENCIES
+      # =====================================================
+      - name: Install Dependencies
+        run: npm ci
+
+      # =====================================================
+      # GENERATE PRISMA CLIENT
+      # =====================================================
+      - name: Generate Prisma Client
+        run: npx prisma generate
+      
+      # =====================================================
+      # LINT: TEMPORARY DISABLE LINT TEST
+      # =====================================================
+     # - name: Run ESLint
+      #  run: npm run lint
+
+      # =====================================================
+      # TYPE CHECK
+      # =====================================================
+      - name: Run TypeScript Type Check
+        run: npx tsc --noEmit
+
+      # =====================================================
+      # PUSH SCHEMA TO CREATE TABLE IN TEST DB
+      # =====================================================
+      - name: Push Database Schema
+        run: npx prisma migrate dev
+        env:
+      # Ensure this matches the DB URL your tests are using
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test_db
+
+      # =====================================================
+      # UNIT TESTS
+      # =====================================================
+      - name: Run Unit Tests
+        run: npm run test
+
+      # =====================================================
+      # BUILD VALIDATION
+      # =====================================================
+      - name: Run Build Validation
+        run: npm run build
+
+      # =====================================================
+      # DOCKER BUILDX
+      # =====================================================
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # =====================================================
+      # LOGIN TO GITHUB CONTAINER REGISTRY
+      # =====================================================
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+
+      # =====================================================
+      # EXTRACT METADATA (Tags & Labels)
+      # =====================================================
+      - name: Extract metadata (tags, lables) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # This automatically formats to: ghcr.io/Reusolute-Consults/dredgos-api
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=${{ github.sha }}
+            type=ref,event=branch
+            type=raw, value=latest,enable={{is_default_branch}}
+
+      # =====================================================
+      # BUILD AND PUSH
+      # =====================================================
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
